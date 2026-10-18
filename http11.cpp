@@ -12,8 +12,8 @@
 #include <unistd.h>
 #include <csignal>
 #include <sstream>
-
-#define PORT 8080 // Defined placeholder for completeness
+#include <memory>
+#define PORT 8081 // Defined placeholder for completeness
 #define PROTOCOL "HTTP/1.1"
 
 struct HTTPRequest {
@@ -22,6 +22,12 @@ struct HTTPRequest {
     std::string version;
     std::unordered_map<std::string, std::string> headers;
     std::string body;
+};
+
+struct Worker
+{
+    std::thread thrd;
+    std::atomic<bool> finished{false};
 };
 
 class HTTPResponse
@@ -82,49 +88,75 @@ private:
     std::atomic<bool> running;
     std::chrono::milliseconds defaultSleepTime = std::chrono::milliseconds(250);
     std::thread listenerThread;
-    std::vector<std::thread> clientThreads{};
+    std::vector<std::unique_ptr<Worker>> clientThreads{};
 public:
     HTTPServer()
     {
+        // 1. Create socket FIRST
         serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+
+        if (serverSocket < 0) {
+            perror("socket");
+            throw std::runtime_error("socket failed");
+        }
+
+        // 2. Enable SO_REUSEADDR
+        int opt = 1;
+
+        if (setsockopt(serverSocket,
+                       SOL_SOCKET,
+                       SO_REUSEADDR,
+                       &opt,
+                       sizeof(opt)) < 0)
+        {
+            perror("setsockopt");
+            close(serverSocket);
+            throw std::runtime_error("setsockopt failed");
+        }
+
+        // 3. Configure address
         serverAddress = {};
         serverAddress.sin_family = AF_INET;
         serverAddress.sin_port = htons(PORT);
         serverAddress.sin_addr.s_addr = INADDR_ANY;
 
+        // 4. Bind
         if (bind(serverSocket,
                  reinterpret_cast<sockaddr*>(&serverAddress),
-                 sizeof(serverAddress)) < 0) {
+                 sizeof(serverAddress)) < 0)
+        {
+            perror("bind");
+            close(serverSocket);
             throw std::runtime_error("bind failed");
         }
 
-        if (listen(serverSocket, 5) < 0) {
+        // 5. Listen
+        if (listen(serverSocket, 128) < 0)
+        {
+            perror("listen");
+            close(serverSocket);
             throw std::runtime_error("listen failed");
         }
 
-        std::cout << "Server Bound to port: " << PORT << std::endl;
+        std::cout << "Server bound to port " << PORT << '\n';
 
         running.store(true);
 
         listenerThread = std::thread(
             &HTTPServer::spawnListeningThread, this
         );
-
-
     }
-
     ~HTTPServer()
     {
         running.store(false);
 
-        // Stop listener before accessing clientThreads.
         if (listenerThread.joinable()) {
             listenerThread.join();
         }
 
-        for (auto& thread : clientThreads) {
-            if (thread.joinable()) {
-                thread.join();
+        for (auto& worker : clientThreads) {
+            if (worker->thrd.joinable()) {
+                worker->thrd.join();
             }
         }
 
@@ -143,6 +175,7 @@ private:
         // Once we get one, we accept and store into a thread map
         while (running.load())
         {
+            garbageCollector();
 
             int result = poll(&pfd, 1, 250); // poll until 250ms passes
 
@@ -163,11 +196,17 @@ private:
                     continue;
                 }
 
-                clientThreads.emplace_back(
-                    &HTTPServer::spawnClientFdThread,
-                    this,
-                    tempClientFd
-                );
+                auto worker = std::make_unique<Worker>();
+                Worker* ptr = worker.get();
+
+                worker->thrd = std::thread([this, tempClientFd, ptr](){
+                    spawnClientFdThread(tempClientFd);
+
+                    // finish the thread
+                    ptr->finished.store(true);
+                });
+                clientThreads.push_back(std::move(worker));
+
             }
         }
     }
@@ -179,7 +218,7 @@ private:
         // 0 : timeout has reached (nothing received)
         // < 0 : an error has occurred
         //
-        std::cout << "Client thread spawned with clientFd => " << clientFd << std::endl;
+        // std::cout << "Client thread spawned with clientFd => " << clientFd << std::endl;
         struct pollfd pfd;
         pfd.fd = clientFd;
         pfd.events = POLLIN; // Only care about incoming data
@@ -203,7 +242,7 @@ private:
                     char buffer[4096] = {0};
 
                     // Return bytes read
-                    printf("Beginning Poll Recv\n");
+                    // printf("Beginning Poll Recv\n");
                     ssize_t bytesRead = recv(clientFd, buffer, sizeof(buffer), 0);
                     if (bytesRead > 0)
                     {
@@ -218,7 +257,7 @@ private:
                     else if (bytesRead == 0)
                     {
                         // Client disconnected gracefully
-                        std::cout << "Client disconnected.\n";
+                        // std::cout << "Client disconnected.\n";
                         break;
                     }
                     else
@@ -239,7 +278,7 @@ private:
         // LOGIC FIX: Moved outside the while-loop so it executes after hitting 'break'
         if (request_complete)
         {
-            std::cout << "READ CURL REQ: => " << full_req << std::endl;
+            // std::cout << "READ CURL REQ: => " << full_req << std::endl;
 
             // Parse Req Here
             HTTPRequest req{};
@@ -252,9 +291,12 @@ private:
                 HTTPResponse h = HTTPResponse("GET", "200", "OK" );
                 h.add_content_plain_text("\nHELLO GAMERS\n");
                 std::string t = h.get_response();
-                printf("Sending response:\n %s", t.data());
+                // printf("Sending response:\n %s", t.data());
 
-                send(clientFd, t.data(), t.size(), 0);
+                if(!sendAll(clientFd, t))
+                {
+                    std::cout << "failed send" << std::endl;
+                }
             }
         }
 
@@ -283,11 +325,11 @@ private:
 
             if (line_stream >> requestBuild->method >> requestBuild->target >> requestBuild->version)
             {
-                std::cout << "parsed request with method: " <<
-                    requestBuild->method <<
-                    "\nTarget: "<< requestBuild->target <<
-                    "\nVersion: " << requestBuild->version <<
-                    std::endl;
+                // std::cout << "parsed request with method: " <<
+                //     requestBuild->method <<
+                //     "\nTarget: "<< requestBuild->target <<
+                //     "\nVersion: " << requestBuild->version <<
+                //     std::endl;
             } else {
                 std::cout << "Failed parsing req line" << std::endl;
             }
@@ -325,6 +367,57 @@ private:
         }
 
 
+    }
+
+    // periodically checks if threads need to be joined
+    void garbageCollector()
+    {
+        auto it = clientThreads.begin();
+
+        while (it != clientThreads.end())
+        {
+            if ((*it)->finished.load())
+            {
+                if ((*it)->thrd.joinable()) {
+                    (*it)->thrd.join();
+                }
+
+                it = clientThreads.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+    }
+
+    // Guarantee Send all bytes
+    bool sendAll(int clientFd, const std::string& response)
+    {
+        size_t totalSent = 0;
+        size_t totalSize = response.size();
+
+        while(totalSent < totalSize)
+        {
+            ssize_t bytesSent = send(
+                clientFd,
+                response.data()+ totalSent,
+                totalSize - totalSent,
+                MSG_NOSIGNAL
+            );
+
+            if (bytesSent > 0)
+            {
+                totalSent += static_cast<size_t>(bytesSent);
+            }
+            else if(bytesSent == -1 && errno == EINTR)
+                continue;
+            else
+            {
+                perror("send failed");
+                return false;
+            }
+        }
+        return true;
     }
 
 };
