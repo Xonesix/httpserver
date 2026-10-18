@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -10,22 +11,45 @@
 #include <sys/poll.h>
 #include <unistd.h>
 #include <csignal>
-#define PORT 8080 // Defined placeholder for completeness
+#include <sstream>
+#define PORT 8081 // Defined placeholder for completeness
+
+struct HTTPRequest {
+     std::string method;
+    std::string target;
+    std::string version;
+    std::unordered_map<std::string, std::string> headers;
+    std::string body;
+};
+
+struct HTTPResponse 
+{
+  /*
+   * Example response
+   * HTTP/1.1 200 OK\r\n
+   * Content-Type: text/plain\r\n
+   * Content-Length: 13\r\n
+   * Connection: Close\r\n
+   * 
+   * Hello World!
+   * \r\n\r\n
+   */  
+};
 
 class HTTPServer
 {
 private:
-    std::unordered_map<int, std::thread> fdToThreadMap = {};
+    std::vector<std::thread> fdToThreadMap = {};
     int serverSocket;
     sockaddr_in serverAddress;
     std::atomic<bool> running;
     std::chrono::milliseconds defaultSleepTime = std::chrono::milliseconds(250);
     std::thread listenerThread;
+    std::vector<std::thread> clientThreads{};
 public:
     HTTPServer()
     {
         serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-
         serverAddress = {};
         serverAddress.sin_family = AF_INET;
         serverAddress.sin_port = htons(PORT);
@@ -43,22 +67,25 @@ public:
 
         std::cout << "Server Bound to port: " << PORT << std::endl;
 
+        running.store(true);
+
         listenerThread = std::thread(
             &HTTPServer::spawnListeningThread, this
         );
+
+
     }
 
     ~HTTPServer()
     {
         running.store(false);
 
-        // Listener must stop adding threads before we iterate the map.
+        // Stop listener before accessing clientThreads.
         if (listenerThread.joinable()) {
             listenerThread.join();
         }
 
-        // All workers must exit before the HTTPServer is destroyed.
-        for (auto& [fd, thread] : fdToThreadMap) {
+        for (auto& thread : clientThreads) {
             if (thread.joinable()) {
                 thread.join();
             }
@@ -70,6 +97,7 @@ public:
 private:
     void spawnListeningThread()
     {
+        std::cout << "Listening thread spawned" << std::endl;
         pollfd pfd{};
         pfd.fd = serverSocket;
         pfd.events = POLLIN;
@@ -92,17 +120,17 @@ private:
             if (pfd.revents & POLLIN)
             {
                 int tempClientFd = accept(serverSocket, nullptr, nullptr);
-                if (tempClientFd < 0)
-                {
+
+                if (tempClientFd < 0) {
                     perror("accept");
                     continue;
                 }
 
-
-                // place thread here
-                fdToThreadMap.emplace(tempClientFd,
-                    std::thread(&HTTPServer::spawnClientFdThread, this, tempClientFd));
-
+                clientThreads.emplace_back(
+                    &HTTPServer::spawnClientFdThread,
+                    this,
+                    tempClientFd
+                );
             }
         }
     }
@@ -113,6 +141,8 @@ private:
         // If poll returns: > 0 Data is ready to read
         // 0 : timeout has reached (nothing received)
         // < 0 : an error has occurred
+        //
+        std::cout << "Client thread spawned with clientFd => " << clientFd << std::endl;
         struct pollfd pfd;
         pfd.fd = clientFd;
         pfd.events = POLLIN; // Only care about incoming data
@@ -136,6 +166,7 @@ private:
                     char buffer[4096] = {0};
 
                     // Return bytes read
+                    printf("Beginning Poll Recv\n");
                     ssize_t bytesRead = recv(clientFd, buffer, sizeof(buffer), 0);
                     if (bytesRead > 0)
                     {
@@ -172,17 +203,109 @@ private:
         if (request_complete)
         {
             std::cout << "READ CURL REQ: => " << full_req << std::endl;
+
+            // Parse Req Here
+            HTTPRequest req{};
+            HTTPServer::parseHttpRequest(full_req, &req);
+
             // Send CurlReqBack
+            // 
+            if (req.method == "GET")
+            {
+                
+            }
         }
 
         // Clean up socket when done
         close(clientFd);
     }
+
+    // optimization: do const std::string& req (avoid copying values)
+    // Takes 2 params req and requestBuild
+    // req, string containing a full HTTP request (excluding Body)
+    // requestBuild variable to fill in vars with
+    void parseHttpRequest(std::string req, HTTPRequest* requestBuild)
+    {
+
+        std::istringstream stream(req);
+        std::string line;
+
+        // First Get first 3 args (method endpoint, http/versionnum)
+        if(std::getline(stream, line))
+        {
+            if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+            }
+
+            std::istringstream line_stream(line);
+
+            if (line_stream >> requestBuild->method >> requestBuild->target >> requestBuild->version)
+            {
+                std::cout << "parsed request with method: " <<
+                    requestBuild->method <<
+                    "\nTarget: "<< requestBuild->target <<
+                    "\nVersion: " << requestBuild->version <<
+                    std::endl;
+            } else {
+                std::cout << "Failed parsing req line" << std::endl;
+            }
+
+        }
+        // Now get next headers
+        while (std::getline(stream, line))
+        {
+            // Remove trailing carriage return
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+
+            // Empty line = end of headers
+            if (line.empty())
+                break;
+
+            size_t colon = line.find(':');
+
+            if (colon == std::string::npos) {
+                std::cerr << "Invalid header\n";
+                return;
+            }
+
+            std::string key = line.substr(0, colon);
+            std::string value = line.substr(colon + 1);
+
+            // Remove leading whitespace from value
+            size_t start = value.find_first_not_of(" \t");
+            if (start != std::string::npos)
+                value.erase(0, start);
+            else
+                value.clear();
+
+            requestBuild->headers[key] = value;
+        }
+
+
+    }
+
 };
 
 
 
-int main() {
-    HTTPServer h;
-    std::this_thread::sleep_for(std::chrono::minutes(5));
+volatile std::sig_atomic_t stopRequested = 0;
+
+void handleSigint(int) {
+    stopRequested = 1;
+}
+
+int main()
+{
+    std::signal(SIGINT, handleSigint);
+
+    HTTPServer server;
+
+    while (!stopRequested) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(100)
+        );
+    }
+
+    return 0; // Destructor called automatically
 }
