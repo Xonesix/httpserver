@@ -12,7 +12,9 @@
 #include <unistd.h>
 #include <csignal>
 #include <sstream>
-#define PORT 8081 // Defined placeholder for completeness
+
+#define PORT 8080 // Defined placeholder for completeness
+#define PROTOCOL "HTTP/1.1"
 
 struct HTTPRequest {
      std::string method;
@@ -22,7 +24,7 @@ struct HTTPRequest {
     std::string body;
 };
 
-struct HTTPResponse 
+class HTTPResponse
 {
   /*
    * Example response
@@ -30,10 +32,45 @@ struct HTTPResponse
    * Content-Type: text/plain\r\n
    * Content-Length: 13\r\n
    * Connection: Close\r\n
-   * 
+   *
    * Hello World!
    * \r\n\r\n
-   */  
+   */
+  std::ostringstream builder;
+  bool doesContentExist = false;
+  public:
+
+      HTTPResponse(std::string method, std::string code, std::string humanReadableCode)
+      {
+          builder << PROTOCOL << " " << code << " " << humanReadableCode << "\r\n";
+      }
+
+      void add_content_plain_text(std::string content)
+      {
+          builder << "Content-Type:" << " " << "text/plain" << "\r\n";
+          builder << "Content-Length:" << " " << content.size() << "\r\n";
+          builder << "Connection: close\r\n\r\n";
+          builder << content;
+          doesContentExist = true;
+      }
+
+      std::string get_response()
+      {
+
+
+          // if content append
+          // if (content) { builder << content;}
+
+          if (!doesContentExist)
+          {
+            builder << "Content-Length:" << " " << 0 << "\r\n";
+            builder << "Connection: close\r\n\r\n";
+          }
+
+          return builder.str();
+      }
+
+
 };
 
 class HTTPServer
@@ -209,10 +246,15 @@ private:
             HTTPServer::parseHttpRequest(full_req, &req);
 
             // Send CurlReqBack
-            // 
+            //
             if (req.method == "GET")
             {
-                
+                HTTPResponse h = HTTPResponse("GET", "200", "OK" );
+                h.add_content_plain_text("\nHELLO GAMERS\n");
+                std::string t = h.get_response();
+                printf("Sending response:\n %s", t.data());
+
+                send(clientFd, t.data(), t.size(), 0);
             }
         }
 
