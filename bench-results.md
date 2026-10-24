@@ -275,3 +275,157 @@ This run used 4 wrk threads and no `Connection: close` header. The server still 
 - Raise the `listen()` backlog to `SOMAXCONN` (and check `net.core.somaxconn`) to remove the SYN-drop timeouts at 200+ connections.
 - Use **wrk as the main benchmark** from now on (`load_testing.py` tops out at ~5k RPS). Add a keep-alive run (no `Connection: close` header) once keep-alive exists, and record memory and thread count.
 - Later: non-blocking sockets + `epoll` event loop.
+
+---
+
+## Version 3 — epoll event loop + fixed worker pool
+
+**Date:** 2026-10-24 · **Commit:** uncommitted changes on top of `48824fb` ("add epollin supp") · **Source:** `http11_epoll.cpp` · **Port:** 8080
+
+V3 skipped the thread-pool-with-work-queue step from the V2 plan and went straight to non-blocking sockets with `epoll`.
+
+### Build
+
+Same flags as V2:
+
+```sh
+g++ -std=c++17 -O3 -march=native -flto -DNDEBUG -pthread http11_epoll.cpp -o httpserver_epoll
+```
+
+### Architecture
+
+- **1 listener thread** waits on its own epoll instance (`listen_epoll_fd`) that holds only the listening socket. On each wakeup it calls `accept()`, makes the client socket non-blocking (`fcntl` + `O_NONBLOCK`), allocates a `ClientSession`, and registers the socket with the workers' epoll as `EPOLLIN | EPOLLET | EPOLLONESHOT`.
+- **`WORKER_THREADS` (3) worker threads** all `epoll_wait` on one shared epoll instance (`epoll_fd`, up to 64 events per call). For each ready socket, a worker `recv()`s until `EAGAIN` or `\r\n\r\n`, appending to `session->incomplete_buffer` so a request split across packets is put back together.
+- When the request is complete, the worker parses it, sends `HELLO GAMERS` with `Connection: close`, and then **closes the socket right away** (`EPOLL_CTL_DEL` + `close` + `delete session`). If the request isn't complete yet, it re-arms the socket with `EPOLL_CTL_MOD` (needed because of `EPOLLONESHOT`).
+- `EPOLLONESHOT` makes sure only one worker handles a given socket at a time, so the session needs no lock.
+- The thread count is fixed no matter how many connections there are: main + listener + N workers.
+
+### Bugs fixed along the way
+
+1. **Segfault on the first request (shared epoll instance).**
+   At first, the listener and the workers waited on the same `epoll_fd`. The listening socket was registered with `data.fd = serverSocket`, and clients with `data.ptr = session`. `epoll_data` is a union and any waiting thread can be given any event, so a worker would sometimes get the listening socket's event and read the fd number (e.g. `3`) as a `ClientSession*`. `session->fd` then dereferenced address `0x3` and crashed. The opposite mix-up could happen too: the listener took a client's event, blocked in `accept()`, and used up that client's one-shot event. **Fix:** give the listener its own epoll instance.
+
+2. **~21k RPS ceiling (the server waited for the client to close).**
+   The first working version sent `Connection: close` but didn't close the socket. It waited for wrk to close first, then cleaned up on `recv() == 0`. That leaked nothing, but it limited throughput:
+   - In TCP, **the side that closes first** keeps the connection in `TIME_WAIT` for about 60 s. Since wrk closed first, every finished connection held one of wrk's ephemeral ports (Linux range 32768–60999, ~28k ports).
+   - At 20k+ connections/s the range filled up. `ss` showed **28,229** `TIME_WAIT` sockets, and every new `connect()` from wrk had to search for a port it was allowed to reuse.
+   - Each connection also cost a second epoll wakeup, an `EPOLL_CTL_MOD`, and a `recv()` returning 0.
+
+   **Fix:** the server closes as soon as the response is sent, the same as V2. `TIME_WAIT` now sits on the server side, where it costs nothing because `accept()` never picks a port.
+
+   | `wrk -t4 -c28`, 3 workers, 10 s     | RPS     | p50   | p99     |
+   |-------------------------------------|--------:|------:|--------:|
+   | Server waits for the client to close | 21,154  | 83 µs | 3.70 ms |
+   | Server closes first                  | 205,116 | 56 µs | 306 µs  |
+
+   More workers didn't help before the fix (8 workers gave 20,199 RPS), which showed the limit wasn't in the server's threads.
+
+3. **Logging removed.** All remaining `std::cout` / `std::cerr` calls were removed. Only `perror` on error paths is left.
+
+### Test setup
+
+| Setting | Value |
+|---------|-------|
+| Tool    | wrk 4.1.0 (Debian), `--latency` |
+| Target  | `GET http://127.0.0.1:8080/` (V3), `http://127.0.0.1:8081/` (V2) |
+| Duration | 30 s per run, 30 s idle between runs |
+| Connections | New TCP connection per request (the server closes after every response) |
+| Host | Linux 6.6 (WSL2), 28 hardware threads, client and server on the same machine |
+| Memory | Peak RSS (`VmHWM` from `/proc/<pid>/status`) read at the end of each run |
+
+**V2 was rerun in the same session** with the same build flags so the numbers can be compared directly. Today's V2 result (50.4k RPS) is about 18% below the 61.8k from 2026-10-18 with the same command, so WSL2 varies noticeably from day to day. Compare numbers measured in the same session.
+
+### Results — V2 vs V3, same session
+
+```sh
+wrk -t4 -c28 -d30s --latency http://127.0.0.1:<port>/     # headline command used for V2
+wrk -t14 -c100 -d30s --latency http://127.0.0.1:<port>/   # best V3 setup (4 workers)
+```
+
+| Run | Server | Requests (30 s) | **RPS** | Avg | p50 | p75 | p90 | p99 | Max | Errors | Peak RSS |
+|-----|--------|----------------:|--------:|----:|----:|----:|----:|----:|----:|-------:|---------:|
+| `-t4 -c28`   | V2 thread-per-conn | 1,517,286  | 50,410      | 538 µs  | 529 µs  | 550 µs  | 586 µs  | 730 µs  | 2.11 ms  | 0 | 3.8 MB |
+| `-t4 -c28`   | **V3, 3 workers**  | 6,329,241  | **210,273** | 64 µs   | **54 µs**  | 79 µs   | 107 µs  | **255 µs**  | 2.59 ms  | 0 | 3.6 MB |
+| `-t14 -c100` | V2 thread-per-conn | 1,476,906  | 49,067      | 1.98 ms | 1.96 ms | 2.02 ms | 2.09 ms | 2.28 ms | 27.17 ms | 0 | 3.9 MB |
+| `-t14 -c100` | **V3, 4 workers**  | 12,329,592 | **409,623** | 188 µs  | **142 µs** | 219 µs  | 320 µs  | **692 µs**  | 51.59 ms | 0 | 3.6 MB |
+
+**V2 → V3**
+
+| Metric | `-t4 -c28` | `-t14 -c100` |
+|--------|-----------:|-------------:|
+| RPS    | 50.4k → 210.3k (**4.2×**) | 49.1k → 409.6k (**8.3×**) |
+| p50    | 529 → 54 µs (**9.8× lower**) | 1.96 ms → 142 µs (**13.8× lower**) |
+| p99    | 730 → 255 µs (2.9× lower) | 2.28 ms → 692 µs (3.3× lower) |
+| Max    | 2.11 → 2.59 ms (slightly worse) | 27.2 → 51.6 ms (worse) |
+
+**Resume line:** rewrote the server from thread-per-connection to a non-blocking `epoll` event loop with a fixed 4-thread worker pool, raising throughput **8.3× (49k → 410k requests/sec)** and cutting p50 latency **13.8× (1.96 ms → 142 µs)** across 12.3M wrk requests with zero errors.
+
+### Concurrency sweep (V3, 3 workers)
+
+Same commands as the V2 wrk sweep:
+
+```sh
+for c in 28 100 200; do
+  wrk -t8 -c$c -d30s --latency -H 'Connection: close' http://127.0.0.1:8080/
+done
+```
+
+| Connections | Requests (30 s) | **RPS** | Avg | p50 | p75 | p90 | p99 | Max | Errors |
+|------------:|----------------:|--------:|----:|----:|----:|----:|----:|----:|-------:|
+| 28  | 5,408,873  | **180,198** | 105 µs | 72 µs  | 110 µs | 164 µs | 0.93 ms | 3.63 ms   | 0 |
+| 100 | 10,446,597 | **347,072** | 204 µs | 149 µs | 238 µs | 340 µs | 0.68 ms | 39.59 ms  | 0 |
+| 200 | 10,828,581 | **359,755** | 783 µs | 204 µs | 316 µs | 450 µs | 0.99 ms | 211.38 ms | 0 |
+
+Compared with the V2 sweep from 2026-10-18. V2 wasn't rerun for these three, and given the day-to-day variance above, the ratios are approximate.
+
+| Connections | V2 RPS | V3 RPS | V3 / V2 | V2 p99 | V3 p99 | V2 errors | V3 errors |
+|------------:|-------:|-------:|--------:|-------:|-------:|----------:|----------:|
+| 28  | 62,607 | 180,198 | ~2.9× | 0.65 ms   | 0.93 ms | 0           | 0 |
+| 100 | 53,172 | 347,072 | ~6.5× | 2.51 ms   | 0.68 ms | 0           | 0 |
+| 200 | 58,772 | 359,755 | ~6.1× | 122.06 ms | 0.99 ms | 20 timeouts | 0 |
+
+**What this shows**
+
+- **V3 scales with load. V2 didn't.** V2 got slower going from 28 to 100 connections (62.6k → 53.2k). V3 nearly doubles (180k → 347k) and is still climbing slightly at 200.
+- **No SYN-drop timeouts at 200 connections**, with the backlog still at 128. V3's listener only runs `accept` + `fcntl` + `epoll_ctl` per connection, with no thread creation, so it empties the accept queue fast enough that it doesn't overflow.
+- **p99 stays under 1 ms at every level.** The max grows (40 ms → 211 ms), so a handful of requests still get stuck in a queue somewhere (WSL2 scheduling, or a worker busy with a 64-event batch).
+
+### Worker-count sweep (V3)
+
+5 s runs, RPS. These are short runs, so expect about ±15% noise.
+
+| Workers | `-t4 -c28` | `-t4 -c100` | `-t8 -c100` | `-t14 -c100` |
+|--------:|-----------:|------------:|------------:|-------------:|
+| 1  | 108k | 119k | 93k  | 86k  |
+| 2  | 215k | 234k | 246k | 183k |
+| 3  | 210k | 235k | 348k | 297k |
+| 4  | 201k | 233k | 335k | **385k** |
+| 8  | 69k  | 98k  | 60k  | 60k  |
+| 14 | 65k  | 70k  | 57k  | 51k  |
+
+- **The sweet spot is 3–4 workers.** One worker caps at ~100k. Two already double that.
+- **8+ workers is 3–6× slower.** All workers share **one epoll instance**, so every `epoll_wait`, the listener's `EPOLL_CTL_ADD`, and each worker's `EPOLL_CTL_DEL` contend for that instance's internal lock. Past ~4 threads, the lock contention and context switches cost more than the extra threads add.
+- **wrk and the server share the same 28 hardware threads.** With few connections (`-c28`), extra wrk threads just compete with the server. With `-c100`, wrk needs 8–14 threads to produce enough load.
+
+### Memory and threads
+
+- Peak RSS is about **3.6 MB** for V3 and about 3.8–3.9 MB for V2. Both are tiny, because V2's per-thread stacks are mostly virtual memory that never gets touched.
+- V3's thread count is **fixed** at main + listener + N workers (5 with 3 workers). V2 creates one OS thread per connection. The live thread count wasn't sampled *during* the runs; the V2 value read at the end (2) is after all connections had closed.
+
+### What's still not great
+
+- **One shared epoll instance** is the scaling limit (see the worker sweep). Adding cores makes it worse instead of better.
+- **A single listener thread** handles every `accept()` and does one accept per `epoll_wait` wakeup. It doesn't loop `accept()` until `EAGAIN`, so it pays an extra syscall per connection.
+- **No keep-alive.** Every request still pays a full TCP handshake + teardown. Most of V3's per-request cost is now in the kernel's TCP code, not the server.
+- **Max latency is worse than V2's** (51.6 ms vs 27.2 ms at `-t14 -c100`), even though p99 is 3× better.
+- **Response rebuilt every request** with `ostringstream`; `parseHttpRequest` still copies the request string. Non-GET requests are closed with no response.
+- `ClientSession` is a raw `new`/`delete`; it's correct on every path today, but fragile.
+
+### Plan for Version 4
+
+- **One epoll instance per worker + `SO_REUSEPORT`:** each worker opens its own listening socket on port 8080 and runs its own accept + read + write loop. The kernel spreads new connections across workers, which removes both the shared epoll lock and the single listener. Throughput should then grow with the number of workers instead of collapsing past 4.
+- In the listener, loop `accept4(..., SOCK_NONBLOCK)` until `EAGAIN` (this also removes the two `fcntl` calls).
+- **HTTP/1.1 keep-alive**, then benchmark with and without `-H 'Connection: close'`.
+- Pre-build the static response once, and parse with `std::string_view`.
+- Raise the backlog to `SOMAXCONN`.
+- Sample thread count and RSS *during* runs (e.g. `pidstat -r -t -p <pid> 1`).

@@ -15,7 +15,7 @@
 #include <memory>
 #include <sys/epoll.h>
 #include <fcntl.h>
-#define PORT 8081 // Defined placeholder for completeness
+#define PORT 8080 // Defined placeholder for completeness
 #define PROTOCOL "HTTP/1.1"
 #define MAX_EVENTS 64
 #define WORKER_THREADS 3
@@ -109,7 +109,8 @@ private:
     std::vector<std::unique_ptr<Worker>> clientThreads{};
     std::vector<std::thread> workerThreads;
     // Epoll vars
-    int epoll_fd;
+    int epoll_fd;        // client sockets, shared by workers (data.ptr = ClientSession*)
+    int listen_epoll_fd; // listening socket only, used by the listener thread
 
 public:
     HTTPServer()
@@ -160,7 +161,6 @@ public:
             throw std::runtime_error("listen failed");
         }
 
-        std::cout << "Server bound to port " << PORT << '\n';
 
         running.store(true);
 
@@ -176,6 +176,14 @@ public:
             exit(EXIT_FAILURE);
         }
 
+        // Separate instance for the listener so workers never receive the
+        // serverSocket event (its data.fd would be misread as a ClientSession*)
+        listen_epoll_fd = epoll_create1(0);
+        if(listen_epoll_fd == -1) {
+            perror("listen epoll create failed");
+            exit(EXIT_FAILURE);
+        }
+
         listenerThread = std::thread(&HTTPServer::spawnListeningThread, this);
 
         // 4. Spawn fixed pool of Worker Threads exactly once
@@ -183,8 +191,6 @@ public:
             workerThreads.push_back(std::thread(&HTTPServer::spawnWorkerThread, this));
         }
 
-        std::cout << "Server boot complete. Spawning 1 Listener and " 
-                  << WORKER_THREADS << " Workers.\n";
     }
     ~HTTPServer()
     {
@@ -202,13 +208,14 @@ public:
             }
         }
 
+        close(listen_epoll_fd);
+        close(epoll_fd);
         close(serverSocket);
     }
 
 private:
     void spawnListeningThread()
     {
-        std::cout << "Listening thread spawned" << std::endl;
         // pollfd pfd{};
         // pfd.fd = serverSocket;
         // pfd.events = POLLIN;
@@ -218,12 +225,11 @@ private:
         event.events = EPOLLIN;
         // Store fd to identify when it fires 
         event.data.fd = serverSocket;
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, serverSocket, &event) == -1) {
+        if (epoll_ctl(listen_epoll_fd, EPOLL_CTL_ADD, serverSocket, &event) == -1) {
             perror("Failed to add serverSocket to epoll");
             return;
         }
 
-        std::cout << " EPOLL HAS BEEN INITIALIZED\n";
 
         struct epoll_event listen_events[1];
 
@@ -234,7 +240,7 @@ private:
         {
 
             // 1. SLEEP HERE until a new connection arrives (1000ms timeout so we can check running.load())
-            int nfds = epoll_wait(epoll_fd, listen_events, 1, 1000);
+            int nfds = epoll_wait(listen_epoll_fd, listen_events, 1, 1000);
 
             if (nfds < 0) {
                 if (errno == EINTR) continue; // Interrupted by system signal (like Ctrl+C), try again
@@ -296,7 +302,6 @@ private:
 void spawnWorkerThread()
 {
     struct epoll_event events[MAX_EVENTS];
-    std::cout << "Worker Thread " << std::this_thread::get_id() << " Booting up\n";
     
     while(running.load())
     {
@@ -347,7 +352,7 @@ void spawnWorkerThread()
 
             if (connection_closed)
             {
-                std::cout << "[FD " << client_fd << "] Disconnected. Cleaning up heap memory.\n";
+                // std::cout << "[FD " << client_fd << "] Disconnected. Cleaning up heap memory.\n";
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
                 close(client_fd);
                 delete session; 
@@ -366,14 +371,15 @@ void spawnWorkerThread()
                         h.add_content_plain_text("\nHELLO GAMERS\n");
                         std::string t = h.get_response();
 
-                        if(!sendAll(client_fd, t))
-                        {
-                            std::cout << "failed send" << std::endl;
-                        }
+                        sendAll(client_fd, t);
                     }
 
-                    // FIX 2: Clear the session buffer now that the request has been fully processed
-                    session->incomplete_buffer.clear();
+                    // We advertised Connection: close, so close now. Closing first puts
+                    // TIME_WAIT on the server side instead of exhausting client ports
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                    close(client_fd);
+                    delete session;
+                    continue;
                 }
 
                 // 6. Re-arm the socket safely using EPOLLONESHOT
@@ -445,7 +451,6 @@ void spawnWorkerThread()
                     else
                     {
                         // Socket error occurred
-                        std::cerr << "Read error occurred.\n";
                         break;
                     }
                 }
@@ -475,10 +480,7 @@ void spawnWorkerThread()
                 std::string t = h.get_response();
                 // printf("Sending response:\n %s", t.data());
 
-                if(!sendAll(clientFd, t))
-                {
-                    std::cout << "failed send" << std::endl;
-                }
+                sendAll(clientFd, t);
             }
         }
 
@@ -513,7 +515,6 @@ void spawnWorkerThread()
                 //     "\nVersion: " << requestBuild->version <<
                 //     std::endl;
             } else {
-                std::cout << "Failed parsing req line" << std::endl;
             }
 
         }
@@ -531,7 +532,6 @@ void spawnWorkerThread()
             size_t colon = line.find(':');
 
             if (colon == std::string::npos) {
-                std::cerr << "Invalid header\n";
                 return;
             }
 
