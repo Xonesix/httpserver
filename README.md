@@ -15,13 +15,11 @@ An HTTP/1.1 server written from scratch in C++17 on raw POSIX sockets (`socket` 
 
 The Python client hits its own limit at about 5k RPS, so V2 was also benchmarked with **wrk**:
 
-| Version | Connections | Requests/sec | p50 | p99 | Errors |
-|---|---:|---:|---:|---:|---:|
-| V2 | 28 | **62,607** | 0.35 ms | 0.65 ms | 0 |
-| V2 | 100 | 53,172 | 1.83 ms | 2.51 ms | 0 |
-| V2 | 200 | 58,772 | 2.02 ms | 122 ms | 20 timeouts |
+| Version | Connections | Requests (30 s) | Requests/sec | p50 | p99 | Errors |
+|---|---:|---:|---:|---:|---:|---:|
+| V2 | 28 | 1.86M | **61,777** | 0.416 ms | 0.746 ms | 0 |
 
-<sub>`wrk -t8 -c<N> -d30s --latency -H 'Connection: close'`, localhost (WSL2).</sub>
+<sub>`wrk -t4 -c28 -d30s --latency`, localhost (WSL2). The server closes the connection after every response, so each request uses a new TCP connection.</sub>
 
 Full results and analysis: [`bench-results.md`](bench-results.md)
 

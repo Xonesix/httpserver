@@ -245,7 +245,19 @@ The server stayed up for all three runs (same process, same PID, about 5.25M req
 - **At 200 connections the queue starts to overflow.** p50 stays at about 2 ms, but p99 jumps to 122 ms, max to 1.67 s, and 20 requests time out (wrk's default 2 s timeout). With 200 connections constantly reconnecting and a backlog of 128, the accept queue sometimes overflows and SYNs get dropped. This is the same failure as V1's 1 s retries, now happening at about 60× the load.
 - **The limit is now the server's design.** One thread runs `accept()` + `std::thread` creation + `garbageCollector()` for every request, and every request pays for a TCP handshake and the creation and teardown of an OS thread. At ~60k RPS that's ~60k threads created per second.
 
-**Resume line (wrk):** HTTP/1.1 server in C++ handles **~62k requests/sec at 0.35 ms p50 / 0.65 ms p99** (wrk, 28 connections, new TCP connection per request) with zero errors.
+**Rerun (headline number, commit `e00c216`):**
+
+```sh
+wrk -t4 -c28 -d30s --latency http://127.0.0.1:8081/
+```
+
+| Connections | Requests (30 s) | **RPS**    | Transfer  | Avg     | Stdev   | p50      | p75      | p90      | p99      | Max     | Errors |
+|------------:|----------------:|-----------:|----------:|--------:|--------:|---------:|---------:|---------:|---------:|--------:|--------|
+| 28          | 1,859,424       | **61,777** | 5.77 MB/s | 0.43 ms | 0.08 ms | 0.416 ms | 0.449 ms | 0.506 ms | 0.746 ms | 4.26 ms | 0      |
+
+This run used 4 wrk threads and no `Connection: close` header. The server still closes after every response, so each request is still a new TCP connection. It lands within about 1.3% of the `-t8` run (62,607 RPS), so the result is repeatable.
+
+**Resume line (wrk):** benchmarked **61.8K requests/sec** across 1.86M HTTP requests using wrk, at **0.416 ms p50 / 0.746 ms p99** with 28 concurrent localhost connections and zero errors.
 
 ### What's still not great
 
